@@ -1,0 +1,106 @@
+name: Build NootedRed
+
+# NootedRed (RDNA2 fork) CI 构建工作流
+# - push master/main 或手动触发：构建 Release 并上传 Artifact
+# - push v* 标签：构建并自动创建 GitHub Release 附上 kext zip
+# 产物: build/Release/NootedRed-<版本>-RELEASE.zip
+# 签名: 构建后显式 ad-hoc 重签（免证书）——实测官方发布包 kext 无 LC_CODE_SIGNATURE，
+#       工程的打包脚本(strip+zip)先于 Xcode 签名执行，zip 内 kext 为未签名状态；
+#       此处解包 → codesign -fs - → 验证 → 原名重打，保证产物签名有效可加载。
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Release (x86_64)
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      # 兜底：若仓库由 zip 解压直推（无子模块 gitlink），checkout 拉不到依赖，
+      # 此处显式克隆 Lilu 与 MacKernelSDK；若子模块已就位则自动跳过。
+      - name: Ensure dependencies (Lilu & MacKernelSDK)
+        run: |
+          ensure_dep() {
+            dir="$1"; url="$2"; probe="$3"
+            if [ -e "$probe" ]; then
+              echo "[OK] ${probe} 已存在，跳过克隆（子模块就位）"
+            else
+              echo "[..] ${probe} 缺失，克隆 ${url}"
+              rm -rf "$dir"
+              git clone --depth 1 "$url" "$dir"
+            fi
+          }
+          ensure_dep Lilu https://github.com/acidanthera/Lilu.git 'Lilu/Lilu/Headers'
+          ensure_dep MacKernelSDK https://github.com/Acidanthera/MacKernelSDK.git 'MacKernelSDK/Library/x86_64/libkmod.a'
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --show-sdk-path
+
+      - name: Build (Release)
+        run: |
+          set -o pipefail
+          xcodebuild -configuration Release -arch x86_64 build 2>&1 | tee xcodebuild.log
+
+      # 官方链路产物为未签名 kext（打包脚本先于 Xcode 签名跑，strip 还会破坏签名），
+      # 这里解包后显式 ad-hoc 重签并验证，再以原文件名重打 zip。
+      - name: Ad-hoc re-sign & repack
+        run: |
+          set -euo pipefail
+          cd build/Release
+          ZIP_PATH="$(ls -t *.zip | head -1)"
+          echo "==> 待重签: ${ZIP_PATH}"
+          rm -rf _resign && mkdir _resign
+          unzip -q "$ZIP_PATH" -d _resign
+          KEXT="$(find _resign -maxdepth 2 -name '*.kext' -type d)"
+          echo "==> kext: ${KEXT}"
+          codesign --force --sign - --timestamp=none "$KEXT"
+          codesign --verify --verbose=2 "$KEXT"
+          echo "==> 签名信息:"
+          codesign -dv "$KEXT" 2>&1 | sed -n '1,8p'
+          (cd _resign && zip -qry "../_signed.zip" *)
+          mv -f _signed.zip "$ZIP_PATH"
+          rm -rf _resign
+          echo "==> 重签完成:"
+          unzip -l "$ZIP_PATH"
+
+      - name: List build output
+        run: |
+          find build -name '*.zip' -exec ls -la {} \;
+
+      - name: Upload build log (failure only)
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: xcodebuild-failure-log
+          path: xcodebuild.log
+          if-no-files-found: ignore
+
+      - name: Upload kext artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: NootedRed-Release
+          path: build/Release/*.zip
+          if-no-files-found: error
+
+      - name: Create GitHub Release (tag builds)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          gh release create "$TAG" build/Release/*.zip \
+            --title "NootedRed $TAG" \
+            --generate-notes \
+          || gh release upload "$TAG" build/Release/*.zip --clobber
